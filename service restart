@@ -1,4 +1,4 @@
-sudo nano /etc/systemd/system/myscript.service
+sudo nano /etc/systemd/system/PBL.service
 
 
 
