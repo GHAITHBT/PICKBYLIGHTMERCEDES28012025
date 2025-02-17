@@ -1,0 +1,54 @@
+@app.route('/refresh_configuration', methods=['POST'])
+def refresh_configuration():
+    """
+    Endpoint to refresh the Raspberry Pi's configuration and flash LEDs three times.
+    """
+    try:
+        # Fetch the latest configuration from the database
+        global config
+        config = fetch_configuration()
+
+        # Reinitialize GPIO with the updated configuration
+        initialize_gpio(config)
+
+        # Flash all LEDs three times to indicate a successful refresh
+        flash_leds_three_times(config)
+
+        return jsonify({'status': 'Configuration refreshed successfully'}), 200
+    except Exception as e:
+        return jsonify({'error': f'Failed to refresh configuration: {str(e)}'}), 500
+
+def flash_leds_three_times(config):
+    """
+    Flash all LEDs three times to indicate a configuration refresh.
+    """
+    for _ in range(3):
+        # Turn on all LEDs
+        if 'led_expander_address' in config:
+            for material, led_addr in config['led_expander_address'].items():
+                led_pin_num = config['led_pin'][material]
+                led_expander = mcp_devices.get(led_addr)
+                if led_expander:
+                    led_pin = led_expander.get_pin(led_pin_num)
+                    led_pin.value = True  # Turn LED on
+
+        if 'led_pins' in config:
+            for pin in config['led_pins'].values():
+                GPIO.output(pin, GPIO.HIGH)  # Turn LED on
+
+        time.sleep(0.5)  # Keep LEDs on for 0.5 seconds
+
+        # Turn off all LEDs
+        if 'led_expander_address' in config:
+            for material, led_addr in config['led_expander_address'].items():
+                led_pin_num = config['led_pin'][material]
+                led_expander = mcp_devices.get(led_addr)
+                if led_expander:
+                    led_pin = led_expander.get_pin(led_pin_num)
+                    led_pin.value = False  # Turn LED off
+
+        if 'led_pins' in config:
+            for pin in config['led_pins'].values():
+                GPIO.output(pin, GPIO.LOW)  # Turn LED off
+
+        time.sleep(0.5)  # Wait 0.5 seconds before the next flash
