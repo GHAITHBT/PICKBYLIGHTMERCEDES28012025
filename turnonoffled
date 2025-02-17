@@ -1,0 +1,45 @@
+@app.route('/turn_on_leds', methods=['POST'])
+def turn_on_leds():
+    try:
+        # Turn on all MCP expander LEDs
+        if 'led_expander_address' in config:
+            for material, led_addr in config['led_expander_address'].items():
+                led_pin_num = config['led_pin'][material]
+                led_expander = mcp_devices.get(led_addr)
+
+                if led_expander:
+                    led_pin = led_expander.get_pin(led_pin_num)
+                    led_pin.value = True
+                    led_status[material] = True
+
+        # Turn on all native GPIO LEDs
+        if 'led_pins' in config:
+            for pin in config['led_pins'].values():
+                GPIO.output(pin, GPIO.HIGH)
+
+        return jsonify({'status': 'success', 'message': 'All LEDs turned on'}), 200
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@app.route('/turn_off_leds', methods=['POST'])
+def turn_off_leds():
+    try:
+        # Turn off all MCP expander LEDs
+        if 'led_expander_address' in config:
+            for material, led_addr in config['led_expander_address'].items():
+                led_pin_num = config['led_pin'][material]
+                led_expander = mcp_devices.get(led_addr)
+
+                if led_expander:
+                    led_pin = led_expander.get_pin(led_pin_num)
+                    led_pin.value = False
+                    led_status[material] = False
+
+        # Turn off all native GPIO LEDs
+        if 'led_pins' in config:
+            for pin in config['led_pins'].values():
+                GPIO.output(pin, GPIO.LOW)
+
+        return jsonify({'status': 'success', 'message': 'All LEDs turned off'}), 200
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
