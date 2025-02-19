@@ -1,5 +1,9 @@
 @app.route('/test_material_led', methods=['POST'])
 def test_material_led():
+    """
+    Test a specific material's LED and button without confirming to the server.
+    This is a diagnostic endpoint that turns on an LED and waits for a button press.
+    """
     try:
         data = request.json
         material = data.get('material')
@@ -8,115 +12,145 @@ def test_material_led():
         if not material:
             return jsonify({'status': 'error', 'message': 'No material provided'}), 400
             
-        # Create a flag file to track if button was pressed during the test
-        button_pressed = [False]
-        
         # Check if material exists in configuration
         if material in config.get('led_expander_address', {}):
-            # Handle MCP expander LEDs
-            led_addr = config['led_expander_address'][material]
-            led_pin_num = config['led_pin'][material]
-            button_addr = config['button_expander_address'][material]
-            button_pin_num = config['button_pin'][material]
-            
-            led_expander = mcp_devices.get(led_addr)
-            button_expander = mcp_devices.get(button_addr)
-            
-            if led_expander and button_expander:
-                led_pin = led_expander.get_pin(led_pin_num)
-                button_pin = button_expander.get_pin(button_pin_num)
-                
-                # Start testing thread
-                test_thread = threading.Thread(
-                    target=test_mcp_led_button,
-                    args=(material, led_pin, button_pin, button_pressed),
-                    daemon=True
-                )
-                test_thread.start()
-                
-                # Wait for button press or timeout
-                test_thread.join(timeout=10)  # 10 second timeout
-                
-                # Check result
-                if button_pressed[0]:
-                    return jsonify({'status': 'success', 'message': 'Button press detected'}), 200
-                else:
-                    # Make sure LED is turned off if timeout occurs
-                    led_pin.value = False
-                    return jsonify({'status': 'timeout', 'message': 'Button press not detected'}), 200
-                    
-        elif material in config.get('led_pins', {}):
-            # Handle native GPIO LEDs
-            led_pin = config['led_pins'][material]
-            button_pin = config['button_pins'][material]
-            
-            # Start testing thread
-            test_thread = threading.Thread(
-                target=test_gpio_led_button,
-                args=(material, led_pin, button_pin, button_pressed),
+            # Start a background thread to handle the LED and button test
+            threading.Thread(
+                target=test_mcp_expander_material,
+                args=(material,),
                 daemon=True
-            )
-            test_thread.start()
+            ).start()
             
-            # Wait for button press or timeout
-            test_thread.join(timeout=10)  # 10 second timeout
+            # Return immediately - the background thread will handle the LED and wait for button press
+            return jsonify({'status': 'testing', 'message': 'Testing in progress'}), 200
             
-            # Check result
-            if button_pressed[0]:
-                return jsonify({'status': 'success', 'message': 'Button press detected'}), 200
-            else:
-                # Make sure LED is turned off if timeout occurs
-                GPIO.output(led_pin, GPIO.LOW)
-                return jsonify({'status': 'timeout', 'message': 'Button press not detected'}), 200
+        elif material in config.get('led_pins', {}):
+            # Start a background thread to handle the LED and button test
+            threading.Thread(
+                target=test_gpio_material,
+                args=(material,),
+                daemon=True
+            ).start()
+            
+            # Return immediately - the background thread will handle the LED and wait for button press
+            return jsonify({'status': 'testing', 'message': 'Testing in progress'}), 200
+            
         else:
-            # Try to test using the material_id with a placeholder name for the test
-            # This allows testing materials that haven't been saved to the database yet
-            test_material = f"test_material_{material_id}"
-            return jsonify({'status': 'error', 'message': f'Material "{material}" not found in configuration'}), 404
+            # Material not found in configuration
+            return jsonify({
+                'status': 'error',
+                'message': f'Material "{material}" not found in configuration'
+            }), 404
             
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
-def test_mcp_led_button(material, led_pin, button_pin, button_pressed):
-    """Test an MCP expander LED and button pair."""
+def test_mcp_expander_material(material):
+    """Test an MCP expander LED and button pair with callback for completion."""
     print(f"Testing {material} LED and button...")
-    
-    # Turn on LED
-    led_pin.value = True
-    
-    # Wait for button press with timeout
-    start_time = time.time()
-    while time.time() - start_time < 10:  # 10 second timeout
-        if not button_pin.value:  # Button pressed (reads as low)
-            button_pressed[0] = True
-            time.sleep(0.5)  # Debounce
-            led_pin.value = False  # Turn LED off
-            print(f"Button pressed for {material}. Test successful.")
+    try:
+        # Get configuration for this material
+        led_addr = config['led_expander_address'][material]
+        led_pin_num = config['led_pin'][material]
+        button_addr = config['button_expander_address'][material]
+        button_pin_num = config['button_pin'][material]
+        
+        led_expander = mcp_devices.get(led_addr)
+        button_expander = mcp_devices.get(button_addr)
+        
+        if not led_expander or not button_expander:
+            print(f"Error: Expander not found for {material}")
             return
-        time.sleep(0.1)
-    
-    # Turn off LED after timeout
-    led_pin.value = False
-    print(f"Test timeout for {material}. No button press detected.")
+        
+        led_pin = led_expander.get_pin(led_pin_num)
+        button_pin = button_expander.get_pin(button_pin_num)
+        
+        # Turn on the LED
+        led_pin.value = True
+        
+        # Wait for button press or timeout
+        start_time = time.time()
+        button_pressed = False
+        
+        while time.time() - start_time < 10:  # 10 second timeout
+            if not button_pin.value:  # Button pressed (active low)
+                button_pressed = True
+                break
+            time.sleep(0.1)
+        
+        # Turn off the LED
+        led_pin.value = False
+        
+        if button_pressed:
+            print(f"Button press detected for {material}")
+            # Notify client via socketio if available or create a status endpoint
+            return True
+        else:
+            print(f"Timeout waiting for button press on {material}")
+            return False
+            
+    except Exception as e:
+        print(f"Error testing {material}: {e}")
+        # Make sure LED is off in case of error
+        try:
+            led_pin.value = False
+        except:
+            pass
+        return False
 
-def test_gpio_led_button(material, led_pin, button_pin, button_pressed):
-    """Test a native GPIO LED and button pair."""
+def test_gpio_material(material):
+    """Test a GPIO LED and button pair with callback for completion."""
     print(f"Testing {material} LED and button...")
+    try:
+        # Get configuration for this material
+        led_pin = config['led_pins'][material]
+        button_pin = config['button_pins'][material]
+        
+        # Turn on the LED
+        GPIO.output(led_pin, GPIO.HIGH)
+        
+        # Wait for button press or timeout
+        start_time = time.time()
+        button_pressed = False
+        
+        while time.time() - start_time < 10:  # 10 second timeout
+            if GPIO.input(button_pin) == GPIO.LOW:  # Button pressed (active low)
+                button_pressed = True
+                break
+            time.sleep(0.1)
+        
+        # Turn off the LED
+        GPIO.output(led_pin, GPIO.LOW)
+        
+        if button_pressed:
+            print(f"Button press detected for {material}")
+            # Notify client via socketio or create a status endpoint
+            return True
+        else:
+            print(f"Timeout waiting for button press on {material}")
+            return False
+            
+    except Exception as e:
+        print(f"Error testing {material}: {e}")
+        # Make sure LED is off in case of error
+        try:
+            GPIO.output(led_pin, GPIO.LOW)
+        except:
+            pass
+        return False
+
+# Add a status endpoint to check if button was pressed
+@app.route('/test_material_status/<material>', methods=['GET'])
+def test_material_status(material):
+    """Check if a button press was detected for a material being tested."""
+    # Implementation depends on how you track test status - this is one approach
+    global material_test_status
     
-    # Turn on LED
-    GPIO.output(led_pin, GPIO.HIGH)
+    if material in material_test_status:
+        status = material_test_status[material]
+        # Clear status after reporting it
+        if status.get('completed', False):
+            del material_test_status[material]
+        return jsonify(status)
     
-    # Wait for button press with timeout
-    start_time = time.time()
-    while time.time() - start_time < 10:  # 10 second timeout
-        if GPIO.input(button_pin) == GPIO.LOW:  # Button pressed (reads as low)
-            button_pressed[0] = True
-            time.sleep(0.5)  # Debounce
-            GPIO.output(led_pin, GPIO.LOW)  # Turn LED off
-            print(f"Button pressed for {material}. Test successful.")
-            return
-        time.sleep(0.1)
-    
-    # Turn off LED after timeout
-    GPIO.output(led_pin, GPIO.LOW)
-    print(f"Test timeout for {material}. No button press detected.")
+    return jsonify({'status': 'unknown', 'message': 'No test in progress'}), 404
