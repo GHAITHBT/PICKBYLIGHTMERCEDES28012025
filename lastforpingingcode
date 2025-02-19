@@ -1,0 +1,58 @@
+def monitor_connectivity():
+    """
+    Monitor internet connectivity and control LED animation
+    Only run animation when connection is lost, ensure all animations stop when connection is restored
+    """
+    connected = True
+    animation_thread = None
+    stop_animation = threading.Event()
+    
+    def run_animation(mcp_device, stop_event):
+        """Run animation until stop_event is set"""
+        while not stop_event.is_set():
+            animate_led_wave(mcp_device)
+            # Short sleep to check stop_event frequently
+            stop_event.wait(0.1)
+        
+        # Ensure all animation LEDs are off when stopping
+        for pin in [0, 2, 4, 6, 8]:
+            try:
+                led_pin = mcp_device.get_pin(pin)
+                led_pin.value = False
+            except Exception as e:
+                print(f"Error turning off LED pin {pin}: {e}")
+    
+    while True:
+        current_connected = ping_server()
+        
+        # Connection lost: start animation if not already running
+        if not current_connected and connected:
+            connected = False
+            mcp_device = mcp_devices.get("0x20")
+            
+            if mcp_device and animation_thread is None:
+                # Reset the stop event
+                stop_animation.clear()
+                # Start animation thread
+                animation_thread = threading.Thread(
+                    target=run_animation, 
+                    args=(mcp_device, stop_animation)
+                )
+                animation_thread.daemon = True
+                animation_thread.start()
+                print("Connection lost - LED animation started")
+        
+        # Connection restored: stop any running animation
+        elif current_connected and not connected:
+            connected = True
+            
+            if animation_thread is not None:
+                # Signal animation to stop
+                stop_animation.set()
+                # Wait briefly for thread to clean up
+                time.sleep(0.2)
+                animation_thread = None
+                print("Connection restored - LED animation stopped, normal operation resumed")
+        
+        # Check connection every 2 seconds
+        time.sleep(2)
