@@ -1,47 +1,78 @@
 def monitor_connectivity():
     """
     Monitor internet connectivity and control LED animation
-    When connection is lost for 1 continuous minute, light up all LEDs on all detected I2C expanders
-    When connection is restored, turn off all LEDs
+    When connection is lost for 1 continuous minute, run a wave animation on all LEDs
+    of all detected I2C expanders to indicate connection loss
     """
     connected = True
     animation_thread = None
     stop_animation = threading.Event()
     connection_lost_time = None  # Track when connection was first lost
     
-    def get_led_pins_for_address(address, num_pairs):
-        """Get the LED pins based on address type"""
-        if num_pairs == 8:
-            return [0, 2, 4, 6, 8, 10, 12, 14]
-        else:  # 4 pairs
-            return [0, 2, 4, 6]
-    
-    def run_animation(stop_event):
-        """Run animation on all detected devices until stop_event is set"""
-        # Turn on all LEDs on all detected expanders
-        active_leds = {}  # Track which LEDs we've turned on
+    def get_all_detected_devices_and_pins():
+        """Get all detected MCP devices and their available LED pins"""
+        device_pins = {}
         
         for addr, num_pairs in I2C_ADDRESS_ORDER:
             if addr in mcp_devices:
-                device = mcp_devices[addr]
-                led_pins = get_led_pins_for_address(addr, num_pairs)
-                
-                # Store which LEDs we've activated
-                active_leds[addr] = led_pins
-                
-                # Turn on all LEDs for this device
-                for pin in led_pins:
-                    try:
-                        led_pin = device.get_pin(pin)
-                        led_pin.value = True
-                    except Exception as e:
-                        print(f"Error turning on LED pin {pin} on {addr}: {e}")
+                # For 8-pair devices (MCP23017)
+                if num_pairs == 8:
+                    device_pins[addr] = [0, 2, 4, 6, 8, 10, 12, 14]
+                # For 4-pair devices (MCP23008)
+                else:
+                    device_pins[addr] = [0, 2, 4, 6]
+                    
+        return device_pins
+    
+    def run_wave_animation(stop_event):
+        """
+        Run continuous wave animation on all detected devices until stop_event is set
+        This creates a clear visual indicator of connection loss
+        """
+        # Get all available devices and their LED pins
+        device_pins = get_all_detected_devices_and_pins()
+        print(f"Starting connection loss animation on {len(device_pins)} MCP devices")
         
-        # Wait until connectivity is restored or program exits
-        stop_event.wait()
+        # Continue animation until the stop event is set
+        while not stop_event.is_set():
+            # Forward wave animation across all devices
+            for addr, pins in device_pins.items():
+                if addr in mcp_devices:
+                    device = mcp_devices[addr]
+                    # Turn on each pin sequentially
+                    for pin in pins:
+                        if stop_event.is_set():
+                            break
+                        try:
+                            led_pin = device.get_pin(pin)
+                            led_pin.value = True
+                            time.sleep(0.05)  # Short delay for animation effect
+                        except Exception as e:
+                            print(f"Error in wave animation (on): {addr} pin {pin}: {e}")
+            
+            time.sleep(0.2)  # Brief pause between forward and backward waves
+            if stop_event.is_set():
+                break
+                
+            # Backward wave animation (turn off) across all devices
+            for addr, pins in device_pins.items():
+                if addr in mcp_devices:
+                    device = mcp_devices[addr]
+                    # Turn off each pin sequentially
+                    for pin in reversed(pins):
+                        if stop_event.is_set():
+                            break
+                        try:
+                            led_pin = device.get_pin(pin)
+                            led_pin.value = False
+                            time.sleep(0.05)  # Short delay for animation effect
+                        except Exception as e:
+                            print(f"Error in wave animation (off): {addr} pin {pin}: {e}")
+            
+            time.sleep(0.2)  # Brief pause between animation cycles
         
-        # Turn off all LEDs we turned on when stopping
-        for addr, pins in active_leds.items():
+        # Ensure all LEDs are turned off when animation stops
+        for addr, pins in device_pins.items():
             if addr in mcp_devices:
                 device = mcp_devices[addr]
                 for pin in pins:
@@ -49,7 +80,9 @@ def monitor_connectivity():
                         led_pin = device.get_pin(pin)
                         led_pin.value = False
                     except Exception as e:
-                        print(f"Error turning off LED pin {pin} on {addr}: {e}")
+                        print(f"Error turning off LED: {addr} pin {pin}: {e}")
+        
+        print("Connection loss animation stopped")
     
     while True:
         current_connected = ping_server()
@@ -58,7 +91,7 @@ def monitor_connectivity():
         if not current_connected and connected:
             connected = False
             connection_lost_time = time.time()
-            print(f"Connection lost at {time.strftime('%Y-%m-%d %H:%M:%S')} - waiting 1 minute before activating LEDs")
+            print(f"Connection lost at {time.strftime('%Y-%m-%d %H:%M:%S')} - waiting 1 minute before starting animation")
         
         # Connection still lost: check if 1 minute has passed
         elif not current_connected and not connected:
@@ -68,12 +101,12 @@ def monitor_connectivity():
                 stop_animation.clear()
                 # Start animation thread
                 animation_thread = threading.Thread(
-                    target=run_animation, 
+                    target=run_wave_animation, 
                     args=(stop_animation,)
                 )
                 animation_thread.daemon = True
                 animation_thread.start()
-                print(f"Connection lost for 1 minute - LEDs activated on all available expanders at {time.strftime('%Y-%m-%d %H:%M:%S')}")
+                print(f"Connection lost for 1 minute - Wave animation started at {time.strftime('%Y-%m-%d %H:%M:%S')}")
         
         # Connection restored: stop any running animation and reset tracking
         elif current_connected and not connected:
@@ -86,7 +119,7 @@ def monitor_connectivity():
                 # Wait briefly for thread to clean up
                 time.sleep(0.5)
                 animation_thread = None
-                print(f"Connection restored at {time.strftime('%Y-%m-%d %H:%M:%S')} - All LEDs turned off, normal operation resumed")
+                print(f"Connection restored at {time.strftime('%Y-%m-%d %H:%M:%S')} - Animation stopped, normal operation resumed")
         
         # Check connection every 2 seconds
         time.sleep(2)
