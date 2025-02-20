@@ -1,0 +1,92 @@
+def monitor_connectivity():
+    """
+    Monitor internet connectivity and control LED animation
+    When connection is lost for 1 continuous minute, light up all LEDs on all detected I2C expanders
+    When connection is restored, turn off all LEDs
+    """
+    connected = True
+    animation_thread = None
+    stop_animation = threading.Event()
+    connection_lost_time = None  # Track when connection was first lost
+    
+    def get_led_pins_for_address(address, num_pairs):
+        """Get the LED pins based on address type"""
+        if num_pairs == 8:
+            return [0, 2, 4, 6, 8, 10, 12, 14]
+        else:  # 4 pairs
+            return [0, 2, 4, 6]
+    
+    def run_animation(stop_event):
+        """Run animation on all detected devices until stop_event is set"""
+        # Turn on all LEDs on all detected expanders
+        active_leds = {}  # Track which LEDs we've turned on
+        
+        for addr, num_pairs in I2C_ADDRESS_ORDER:
+            if addr in mcp_devices:
+                device = mcp_devices[addr]
+                led_pins = get_led_pins_for_address(addr, num_pairs)
+                
+                # Store which LEDs we've activated
+                active_leds[addr] = led_pins
+                
+                # Turn on all LEDs for this device
+                for pin in led_pins:
+                    try:
+                        led_pin = device.get_pin(pin)
+                        led_pin.value = True
+                    except Exception as e:
+                        print(f"Error turning on LED pin {pin} on {addr}: {e}")
+        
+        # Wait until connectivity is restored or program exits
+        stop_event.wait()
+        
+        # Turn off all LEDs we turned on when stopping
+        for addr, pins in active_leds.items():
+            if addr in mcp_devices:
+                device = mcp_devices[addr]
+                for pin in pins:
+                    try:
+                        led_pin = device.get_pin(pin)
+                        led_pin.value = False
+                    except Exception as e:
+                        print(f"Error turning off LED pin {pin} on {addr}: {e}")
+    
+    while True:
+        current_connected = ping_server()
+        
+        # Connection lost: start tracking time if just disconnected
+        if not current_connected and connected:
+            connected = False
+            connection_lost_time = time.time()
+            print(f"Connection lost at {time.strftime('%Y-%m-%d %H:%M:%S')} - waiting 1 minute before activating LEDs")
+        
+        # Connection still lost: check if 1 minute has passed
+        elif not current_connected and not connected:
+            # Only start animation if connection has been lost for 1 minute
+            if connection_lost_time and (time.time() - connection_lost_time >= 60) and animation_thread is None:
+                # Reset the stop event
+                stop_animation.clear()
+                # Start animation thread
+                animation_thread = threading.Thread(
+                    target=run_animation, 
+                    args=(stop_animation,)
+                )
+                animation_thread.daemon = True
+                animation_thread.start()
+                print(f"Connection lost for 1 minute - LEDs activated on all available expanders at {time.strftime('%Y-%m-%d %H:%M:%S')}")
+        
+        # Connection restored: stop any running animation and reset tracking
+        elif current_connected and not connected:
+            connected = True
+            connection_lost_time = None
+            
+            if animation_thread is not None:
+                # Signal animation to stop
+                stop_animation.set()
+                # Wait briefly for thread to clean up
+                time.sleep(0.5)
+                animation_thread = None
+                print(f"Connection restored at {time.strftime('%Y-%m-%d %H:%M:%S')} - All LEDs turned off, normal operation resumed")
+        
+        # Check connection every 2 seconds
+        time.sleep(2)
