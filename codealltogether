@@ -1,0 +1,311 @@
+from flask import Flask, request, jsonify
+import RPi.GPIO as GPIO
+import socket
+import requests
+import time
+import threading
+import mysql.connector
+from mysql.connector import pooling
+import json
+import subprocess
+import socketio
+import board
+import busio
+from adafruit_mcp230xx.mcp23008 import MCP23008
+from adafruit_mcp230xx.mcp23017 import MCP23017
+from digitalio import Direction, Pull
+
+app = Flask(__name__)
+
+hostname = socket.gethostname()
+sio = socketio.Client()
+
+# Database configuration
+db_config = {
+    'host': '10.110.3.102',
+    'user': 'root',
+    'password': 'Passw0rd123',
+    'database': 'PickByLight'
+}
+
+# Set up database connection pool
+mysql_pool = pooling.MySQLConnectionPool(
+    pool_name="mysql_pool",
+    pool_size=5,
+    **db_config
+)
+
+def get_db_connection():
+    return mysql_pool.get_connection()
+
+# Set up I2C bus
+i2c = busio.I2C(board.SCL, board.SDA)
+
+# Initialize MCP devices for expanders on specified addresses dynamically
+mcp_devices = {}
+
+# Track LED and button status
+led_status = {}
+
+def get_ip_address():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+    except Exception:
+        ip = "127.0.0.1"
+    finally:
+        s.close()
+    return ip
+
+# Fetch configuration from the database
+def fetch_configuration():
+    ip_address = get_ip_address()
+    connection = get_db_connection()
+    try:
+        cursor = connection.cursor(dictionary=True)
+        
+        # Fetch MCP expander configuration
+        cursor.execute('SELECT * FROM rasp_pi_configurations3 WHERE ip_address = %s', (ip_address,))
+        mcp_config = cursor.fetchone()
+        
+        # Fetch native GPIO configuration
+        cursor.execute('SELECT * FROM rasp_pi_configurations WHERE ip_address = %s', (ip_address,))
+        gpio_config = cursor.fetchone()
+
+        config = {}
+        if mcp_config:
+            # Parse JSON fields for MCP expanders
+            mcp_config['led_expander_address'] = json.loads(mcp_config['led_expander_address'])
+            mcp_config['led_pin'] = json.loads(mcp_config['led_pin'])
+            mcp_config['button_expander_address'] = json.loads(mcp_config['button_expander_address'])
+            mcp_config['button_pin'] = json.loads(mcp_config['button_pin'])
+            config.update(mcp_config)
+
+        if gpio_config:
+            # Parse JSON fields for native GPIO
+            gpio_config['led_pins'] = json.loads(gpio_config['led_pins'])
+            gpio_config['button_pins'] = json.loads(gpio_config['button_pins'])
+            config.update(gpio_config)
+
+        return config
+    finally:
+        cursor.close()
+        connection.close()
+
+config = fetch_configuration()
+
+# Initialize GPIO pins using the parsed configuration
+def initialize_gpio(config):
+    GPIO.setmode(GPIO.BCM)
+    GPIO.setwarnings(False)
+
+    # Initialize native GPIO pins
+    if 'led_pins' in config:
+        for pin in config['led_pins'].values():
+            GPIO.setup(pin, GPIO.OUT)
+            GPIO.output(pin, GPIO.LOW)
+
+        for pin in config['button_pins'].values():
+            GPIO.setup(pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+
+    # Initialize MCP devices
+    if 'led_expander_address' in config:
+        for material, led_addr in config['led_expander_address'].items():
+            led_pin_num = config['led_pin'][material]
+            button_addr = config['button_expander_address'][material]
+            button_pin_num = config['button_pin'][material]
+
+            # Initialize only if the expander hasn't been initialized before
+            if led_addr not in mcp_devices:
+                if led_addr in ["0x20", "0x23", "0x24", "0x27"]:
+                    mcp_devices[led_addr] = MCP23017(i2c, address=int(led_addr, 16))
+                elif led_addr in ["0x21", "0x22", "0x25", "0x26"]:
+                    mcp_devices[led_addr] = MCP23008(i2c, address=int(led_addr, 16))
+
+            led_expander = mcp_devices.get(led_addr)
+            button_expander = mcp_devices.get(button_addr)
+
+            # Setup LED pin if expanders exist
+            if led_expander and button_expander:
+                led_pin = led_expander.get_pin(led_pin_num)
+                led_pin.direction = Direction.OUTPUT
+                led_pin.value = False  # LED initially off
+
+                button_pin = button_expander.get_pin(button_pin_num)
+                button_pin.direction = Direction.INPUT
+                button_pin.pull = Pull.UP  # Enable internal pull-up
+                led_status[material] = False  # Track LED status
+            else:
+                print(f"Error: Invalid expander address for material {material}")
+
+# Function to check all LEDs by turning them on for 5 seconds and then off
+def check_leds(config):
+    print("Checking all LEDs...")
+
+    # Turn on all MCP expander LEDs
+    if 'led_expander_address' in config:
+        for material, led_addr in config['led_expander_address'].items():
+            led_pin_num = config['led_pin'][material]
+            led_expander = mcp_devices.get(led_addr)
+
+            if led_expander:
+                led_pin = led_expander.get_pin(led_pin_num)
+                led_pin.value = True  # Turn LED on
+
+    # Turn on all native GPIO LEDs
+    if 'led_pins' in config:
+        for pin in config['led_pins'].values():
+            GPIO.output(pin, GPIO.HIGH)  # Turn LED on
+
+    # Wait for 5 seconds
+    time.sleep(5)
+
+    # Turn off all MCP expander LEDs
+    if 'led_expander_address' in config:
+        for material, led_addr in config['led_expander_address'].items():
+            led_pin_num = config['led_pin'][material]
+            led_expander = mcp_devices.get(led_addr)
+
+            if led_expander:
+                led_pin = led_expander.get_pin(led_pin_num)
+                led_pin.value = False  # Turn LED off
+
+    # Turn off all native GPIO LEDs
+    if 'led_pins' in config:
+        for pin in config['led_pins'].values():
+            GPIO.output(pin, GPIO.LOW)  # Turn LED off
+
+    print("LED check completed.")
+
+# Activate LEDs for materials, turning on all at once and waiting for button presses
+@app.route('/activate_led', methods=['POST'])
+def activate_led():
+    data = request.json
+    materials = data.get('materials', [])
+    machine_name = data.get('machine_name')
+    
+    if not materials or not machine_name:
+        return jsonify({'error': 'No materials or machine_name provided'}), 400
+
+    # Turn on all LEDs at once
+    for material in materials:
+        if material in config.get('led_expander_address', {}):
+            led_addr = config['led_expander_address'][material]
+            led_pin_num = config['led_pin'][material]
+            led_expander = mcp_devices.get(led_addr)
+
+            if led_expander:
+                led_pin = led_expander.get_pin(led_pin_num)
+                led_pin.value = True
+                led_status[material] = True
+                print(f"LED for {material} activated.")
+
+        elif material in config.get('led_pins', {}):
+            led_pin = config['led_pins'][material]
+            GPIO.output(led_pin, GPIO.HIGH)
+            led_status[material] = True
+            print(f"LED for {material} activated.")
+
+        else:
+            return jsonify({'error': f'Invalid material: {material}'}), 400
+
+    # Wait for button presses for each material
+    for material in materials[:]:  # Copy list to allow modification
+        if material in config.get('led_expander_address', {}):
+            led_addr = config['led_expander_address'][material]
+            led_pin_num = config['led_pin'][material]
+            button_addr = config['button_expander_address'][material]
+            button_pin_num = config['button_pin'][material]
+
+            led_expander = mcp_devices.get(led_addr)
+            button_expander = mcp_devices.get(button_addr)
+
+            if led_expander and button_expander:
+                led_pin = led_expander.get_pin(led_pin_num)
+                button_pin = button_expander.get_pin(button_pin_num)
+
+                print(f"Waiting for button press for {material}...")
+                while True:
+                    if not button_pin.value:  # Button pressed (reads as low)
+                        led_pin.value = False  # Turn LED off
+                        led_status[material] = False
+                        print(f"Button pressed for {material}. LED is now OFF.")
+                        send_confirmation(material, machine_name)
+                        break
+                    time.sleep(0.1)
+
+        elif material in config.get('led_pins', {}):
+            led_pin = config['led_pins'][material]
+            button_pin = config['button_pins'][material]
+
+            print(f"Waiting for button press for {material}...")
+            while True:
+                if GPIO.input(button_pin) == GPIO.LOW:  # Button pressed (reads as low)
+                    GPIO.output(led_pin, GPIO.LOW)  # Turn LED off
+                    led_status[material] = False
+                    print(f"Button pressed for {material}. LED is now OFF.")
+                    send_confirmation(material, machine_name)
+                    break
+                time.sleep(0.1)
+
+    return jsonify({'status': 'Materials processed successfully'}), 200
+
+# Send confirmation to the server
+def send_confirmation(material, machine_name):
+    try:
+        response = requests.post(
+            'http://10.110.30.15:6510/confirmation_material',
+            json={'material': material, 'hostname': hostname, 'machine_name': machine_name}
+        )
+        response.raise_for_status()
+    except requests.RequestException as e:
+        print(f"Error sending confirmation for {material}: {e}")
+
+# Deactivate the specified LED
+@app.route('/deactivate_led', methods=['POST'])
+def deactivate_led():
+    data = request.json
+    material = data.get('material')
+    
+    if material in config.get('led_expander_address', {}):
+        # Handle MCP expander LEDs
+        led_addr = config['led_expander_address'][material]
+        led_pin_num = config['led_pin'][material]
+        led_expander = mcp_devices.get(led_addr)
+
+        if led_expander:
+            led_pin = led_expander.get_pin(led_pin_num)
+            led_pin.value = False  # Turn LED off
+            led_status[material] = False
+            return jsonify({'status': 'LED deactivated'}), 200
+
+    elif material in config.get('led_pins', {}):
+        # Handle native GPIO LEDs
+        led_pin = config['led_pins'][material]
+        GPIO.output(led_pin, GPIO.LOW)
+        led_status[material] = False
+        return jsonify({'status': 'LED deactivated'}), 200
+
+    return jsonify({'error': 'Invalid material'}), 400
+
+# Main function to initialize GPIO and run the Flask app
+def main():
+    if not config:
+        print("No configuration found.")
+        return
+
+    initialize_gpio(config)
+    print("GPIO initialized.")
+
+    # Check all LEDs by turning them on for 5 seconds and then off
+    check_leds(config)
+
+    try:
+        # Start Flask app
+        app.run(host='0.0.0.0', port=5000)
+    except KeyboardInterrupt:
+        print("\nExiting...")
+
+if __name__ == '__main__':
+    main()
