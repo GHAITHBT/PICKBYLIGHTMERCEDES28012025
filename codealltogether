@@ -178,7 +178,7 @@ def check_leds(config):
 
     print("LED check completed.")
 
-# Activate LEDs for materials, turning on all at once and waiting for button presses
+# Activate LEDs for materials, turning on all at once and handling any button press
 @app.route('/activate_led', methods=['POST'])
 def activate_led():
     data = request.json
@@ -189,29 +189,8 @@ def activate_led():
         return jsonify({'error': 'No materials or machine_name provided'}), 400
 
     # Turn on all LEDs at once
+    material_controls = {}
     for material in materials:
-        if material in config.get('led_expander_address', {}):
-            led_addr = config['led_expander_address'][material]
-            led_pin_num = config['led_pin'][material]
-            led_expander = mcp_devices.get(led_addr)
-
-            if led_expander:
-                led_pin = led_expander.get_pin(led_pin_num)
-                led_pin.value = True
-                led_status[material] = True
-                print(f"LED for {material} activated.")
-
-        elif material in config.get('led_pins', {}):
-            led_pin = config['led_pins'][material]
-            GPIO.output(led_pin, GPIO.HIGH)
-            led_status[material] = True
-            print(f"LED for {material} activated.")
-
-        else:
-            return jsonify({'error': f'Invalid material: {material}'}), 400
-
-    # Wait for button presses for each material
-    for material in materials[:]:  # Copy list to allow modification
         if material in config.get('led_expander_address', {}):
             led_addr = config['led_expander_address'][material]
             led_pin_num = config['led_pin'][material]
@@ -224,30 +203,43 @@ def activate_led():
             if led_expander and button_expander:
                 led_pin = led_expander.get_pin(led_pin_num)
                 button_pin = button_expander.get_pin(button_pin_num)
-
-                print(f"Waiting for button press for {material}...")
-                while True:
-                    if not button_pin.value:  # Button pressed (reads as low)
-                        led_pin.value = False  # Turn LED off
-                        led_status[material] = False
-                        print(f"Button pressed for {material}. LED is now OFF.")
-                        send_confirmation(material, machine_name)
-                        break
-                    time.sleep(0.1)
+                led_pin.value = True
+                led_status[material] = True
+                material_controls[material] = {'led_pin': led_pin, 'button_pin': button_pin, 'type': 'mcp'}
+                print(f"LED for {material} activated.")
+            else:
+                return jsonify({'error': f'Invalid material: {material}'}), 400
 
         elif material in config.get('led_pins', {}):
             led_pin = config['led_pins'][material]
             button_pin = config['button_pins'][material]
+            GPIO.output(led_pin, GPIO.HIGH)
+            led_status[material] = True
+            material_controls[material] = {'led_pin': led_pin, 'button_pin': button_pin, 'type': 'gpio'}
+            print(f"LED for {material} activated.")
+        else:
+            return jsonify({'error': f'Invalid material: {material}'}), 400
 
-            print(f"Waiting for button press for {material}...")
-            while True:
-                if GPIO.input(button_pin) == GPIO.LOW:  # Button pressed (reads as low)
-                    GPIO.output(led_pin, GPIO.LOW)  # Turn LED off
+    # Wait for any button press and confirm corresponding material
+    remaining_materials = materials.copy()
+    while remaining_materials:
+        for material in remaining_materials[:]:  # Copy list to allow modification
+            control = material_controls[material]
+            if control['type'] == 'mcp':
+                if not control['button_pin'].value:  # Button pressed (low)
+                    control['led_pin'].value = False
                     led_status[material] = False
                     print(f"Button pressed for {material}. LED is now OFF.")
                     send_confirmation(material, machine_name)
-                    break
-                time.sleep(0.1)
+                    remaining_materials.remove(material)
+            elif control['type'] == 'gpio':
+                if GPIO.input(control['button_pin']) == GPIO.LOW:  # Button pressed (low)
+                    GPIO.output(control['led_pin'], GPIO.LOW)
+                    led_status[material] = False
+                    print(f"Button pressed for {material}. LED is now OFF.")
+                    send_confirmation(material, machine_name)
+                    remaining_materials.remove(material)
+        time.sleep(0.1)  # Small delay to prevent CPU overload
 
     return jsonify({'status': 'Materials processed successfully'}), 200
 
